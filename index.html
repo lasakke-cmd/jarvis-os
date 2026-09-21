@@ -416,6 +416,7 @@ nav{width:var(--nav);flex-shrink:0;background:rgba(2,8,18,.98);border-right:1px 
 .toast-err{background:#1a0808;border:1px solid rgba(255,85,85,.4);color:var(--red);}
 .toast-info{background:var(--panel2);border:1px solid var(--border-s);color:var(--text-mid);}
 .toast-icon{font-size:14px;flex-shrink:0;}
+@keyframes spin{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}
 @keyframes tIn{from{opacity:0;transform:translateX(20px);}to{opacity:1;transform:translateX(0);}}
 @keyframes tOut{from{opacity:1;transform:translateX(0);}to{opacity:0;transform:translateX(20px);}}
 /* CONTEXT MENU */
@@ -478,6 +479,7 @@ nav{width:var(--nav);flex-shrink:0;background:rgba(2,8,18,.98);border-right:1px 
     <div class="gsearch-results" id="gsr"></div>
   </div>
   <div class="topbar-date" id="topbarDate"></div>
+  <span id="sync-indicator" onclick="manualSync()" title="Cliquer pour synchroniser maintenant" style="font-size:13px;color:var(--text-dim);padding:0 10px;cursor:pointer;flex-shrink:0;transition:color .2s;font-family:'Share Tech Mono',monospace">⟳</span>
   <div class="clock" id="clock">--:--:--</div>
 </div>
 <div class="body-row">
@@ -1575,9 +1577,12 @@ function saveEvent(){
   const date=document.getElementById('e-date').value;
   if(!title||!date)return;
   const data={title,date,time:document.getElementById('e-time').value,dur:parseInt(document.getElementById('e-dur').value)||0,loc:document.getElementById('e-loc').value.trim(),type:document.getElementById('e-type').value,notes:document.getElementById('e-notes').value.trim()};
-  if(_editEvId)Object.assign(S.data.events.find(x=>x.id===_editEvId),data);
-  else S.data.events.push({id:uid(),...data});
+  let ev;
+  if(_editEvId){Object.assign(ev=S.data.events.find(x=>x.id===_editEvId),data);}
+  else{ev={id:uid(),...data};S.data.events.push(ev);}
   save();closeM('mEvent');_editEvId=null;
+  // Push auto vers Google Calendar si compte connecté
+  if((S.data.googleAccounts||[]).length) gcalPushEvent(ev);
   document.getElementById('mEvent-t').textContent='▸ NOUVEL ÉVÉNEMENT';
   ['e-title','e-date','e-time','e-dur','e-loc','e-notes'].forEach(i=>document.getElementById(i).value='');
   if(S.cur==='agenda')renderAgenda();
@@ -3174,6 +3179,126 @@ function bulkAction(type,val){
   toast(type==='delete'?_selectedTasks.size+' tâche(s) supprimée(s)':type==='done'?'Tâches terminées ✓':'Priorité mise à jour','success');
 }
 
+// ══════════════════════════════════════
+// AUTO-SYNC ENGINE — registre modulaire
+// Chaque intégration s'enregistre avec :
+// { id, label, fn, condition, interval }
+// interval en ms (défaut 15 min)
+// condition() → true si l'intégration est configurée
+// ══════════════════════════════════════
+const _SYNC_INTERVAL = 15 * 60 * 1000; // 15 min
+let _syncIntervals = {};
+let _syncBusy = false;
+
+const _syncRegistry = [
+  {
+    id: 'gcal',
+    label: 'Google Calendar',
+    interval: _SYNC_INTERVAL,
+    condition: () => (S.data.googleAccounts||[]).length > 0,
+    fn: async () => { await gcalImport(); }
+  },
+  {
+    id: 'gtasks',
+    label: 'Google Tasks',
+    interval: _SYNC_INTERVAL,
+    condition: () => (S.data.googleAccounts||[]).length > 0,
+    fn: async () => { await tasksSync(); }
+  },
+  {
+    id: 'notion',
+    label: 'Notion',
+    interval: _SYNC_INTERVAL,
+    condition: () => !!(S.data.notionToken && S.data.notionWorker),
+    fn: async () => { await notionSync(); }
+  },
+  {
+    id: 'drive',
+    label: 'Drive',
+    interval: 30 * 60 * 1000, // 30 min pour Drive
+    condition: () => (S.data.googleAccounts||[]).length > 0 && !!S.data.driveAutoBackup,
+    fn: async () => { await driveBackup(); }
+  }
+];
+
+// Enregistre une nouvelle intégration (pour les futures APIs)
+function registerSync(entry){ _syncRegistry.push(entry); startSyncEntry(entry); }
+
+function _setSyncIndicator(state){
+  const el = document.getElementById('sync-indicator');
+  if(!el) return;
+  if(state === 'syncing'){
+    el.textContent = '↻';
+    el.style.color = 'var(--blue)';
+    el.style.animation = 'spin 1s linear infinite';
+    el.title = 'Synchronisation en cours…';
+  } else if(state === 'ok'){
+    el.textContent = '✓';
+    el.style.color = 'var(--green)';
+    el.style.animation = 'none';
+    el.title = 'Synchronisé — ' + new Date().toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'});
+    setTimeout(() => { if(el.textContent==='✓'){el.textContent='⟳';el.style.color='var(--text-dim)';} }, 3000);
+  } else if(state === 'error'){
+    el.textContent = '⚠';
+    el.style.color = 'var(--red)';
+    el.style.animation = 'none';
+    setTimeout(() => { if(el.textContent==='⚠'){el.textContent='⟳';el.style.color='var(--text-dim)';} }, 5000);
+  }
+}
+
+async function runAllSyncs(silent=true){
+  if(_syncBusy) return;
+  _syncBusy = true;
+  _setSyncIndicator('syncing');
+  let errors = 0;
+  for(const entry of _syncRegistry){
+    if(!entry.condition()) continue;
+    try { await entry.fn(); }
+    catch(e){ console.warn('[AutoSync] '+entry.label, e); errors++; }
+  }
+  _syncBusy = false;
+  _setSyncIndicator(errors ? 'error' : 'ok');
+  if(!silent && errors === 0) toast('Tout synchronisé ✓','success');
+}
+
+function startSyncEntry(entry){
+  if(_syncIntervals[entry.id]) clearInterval(_syncIntervals[entry.id]);
+  _syncIntervals[entry.id] = setInterval(() => {
+    if(entry.condition()) entry.fn().catch(e => console.warn('[AutoSync] '+entry.label, e));
+  }, entry.interval || _SYNC_INTERVAL);
+}
+
+function startAutoSync(){
+  // Premier passage silencieux après 10 secondes (laisser le temps à gcalInit de s'authentifier)
+  setTimeout(() => runAllSyncs(true), 10000);
+  // Démarrage des intervalles
+  _syncRegistry.forEach(startSyncEntry);
+}
+
+// Sync manuelle déclenchable depuis la topbar
+function manualSync(){ runAllSyncs(false); }
+
+// Push automatique d'un événement JARVIS → Google Calendar à la création
+async function gcalPushEvent(ev){
+  const accts = S.data.googleAccounts||[];
+  if(!accts.length || ev.gcalId) return; // pas de compte ou déjà pushé
+  try{
+    const token = await googleEnsureToken(accts[0].email);
+    if(!token) return;
+    const endMs = ev.time&&ev.dur ? new Date(ev.date+'T'+ev.time).getTime()+ev.dur*60000 : null;
+    const body = {summary:ev.title, location:ev.loc||'', description:ev.notes||'',
+      start: ev.time ? {dateTime:ev.date+'T'+ev.time+':00',timeZone:'Europe/Paris'} : {date:ev.date},
+      end: endMs ? {dateTime:new Date(endMs).toISOString().slice(0,16)+':00',timeZone:'Europe/Paris'}
+                 : ev.time ? {dateTime:ev.date+'T'+ev.time+':00',timeZone:'Europe/Paris'} : {date:ev.date}};
+    const res = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events',
+      {method:'POST', headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const r = await res.json();
+    ev.gcalId = r.id; ev.gcalAcct = accts[0].email;
+    save();
+  }catch(e){ console.warn('gcalPushEvent', e); }
+}
+
 // ══ INIT ══
 load();seed();
 S.data.googleAccounts=S.data.googleAccounts||[]; // migrate data saved before multi-account support
@@ -3183,6 +3308,7 @@ updateVoiceCfgNote();
 if(S.data.gcalClientId)setTimeout(gcalInit,1500);
 startDriveAutoBackup();
 startAutoSnapshot();
+startAutoSync();
 // Auto-restore Firebase sync session if configured — Firebase persists the signed-in user
 // itself (IndexedDB), so re-initializing is enough for onAuthStateChanged to pick it back up.
 if(S.data.fbConfig)setTimeout(firebaseInit,1500);
